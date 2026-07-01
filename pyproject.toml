@@ -1,0 +1,25 @@
+[project]
+name = "landemard-2026-bids"
+version = "0.1.0"
+description = "Upload Landemard et al. 2026 fUSI-BIDS dataset to OSF"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "confusius==0.4.0",
+    "osfclient>=0.0.5",
+    "python-dotenv>=1.0.0",
+    "rich>=14.0.0",
+]
+
+[project.scripts]
+landemard-upload = "landemard_2026_bids.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.11,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.11",
+    "ty>=0.0.32",
+]
