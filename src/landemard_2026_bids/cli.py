@@ -40,11 +40,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="OSF personal access token (or set OSF_TOKEN env var)",
     )
     p.add_argument(
-        "--update",
-        action="store_true",
-        help="Re-upload files whose MD5 differs from the remote copy",
-    )
-    p.add_argument(
         "--index-only",
         action="store_true",
         help="Skip upload; regenerate the index from the remote file listing",
@@ -100,16 +95,11 @@ def main(argv: list[str] | None = None) -> None:
             )
             sys.exit(1)
         console.print(f"[bold]BIDS directory[/]: [cyan]{bids_dir}[/]")
-        console.print(
-            "[bold]Mode[/]: "
-            f"[cyan]{'Update existing files' if args.update else 'Skip existing files'}[/]"
-        )
         console.rule("[bold blue]Step 1/3: Upload Dataset Files")
         index = upload.upload_dataset(
             bids_dir,
             token,
             project_id,
-            update=args.update,
         )
 
     console.rule("[bold blue]Step 2/3: Build Dataset Index")

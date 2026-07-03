@@ -89,6 +89,14 @@ def _get_storage_with_retry(
     raise RuntimeError("Failed to connect to OSF storage after retries.")
 
 
+def _local_md5(local_path: Path, cache: dict[Path, str]) -> str:
+    md5 = cache.get(local_path)
+    if md5 is None:
+        md5 = checksum(local_path)
+        cache[local_path] = md5
+    return md5
+
+
 def _parse_index_entry(value: object) -> IndexEntry | None:
     if not isinstance(value, dict):
         return None
@@ -105,36 +113,34 @@ def _parse_index_entry(value: object) -> IndexEntry | None:
         else None
     )
 
-    return {"osf_path": osf_path, "size": size}
+    raw_md5 = value_dict.get("md5")
+    md5 = raw_md5 if isinstance(raw_md5, str) else None
 
-
-def _get_index_osf_path(index: DatasetIndex, rel_path: str) -> str | None:
-    entry = index.get(rel_path)
-    if entry is None:
-        return None
-    osf_path = entry.get("osf_path")
-    if not isinstance(osf_path, str):
-        return None
-    return osf_path
+    return {"osf_path": osf_path, "size": size, "md5": md5}
 
 
 def _load_remote_index(bids_root_folder: Storage) -> DatasetIndex:
-    try:
-        index_file: File | None = None
-        for remote_file in bids_root_folder.files:
-            if remote_file.name == INDEX_FILENAME:
-                index_file = remote_file
-                break
+    """Download and parse ``dataset_index.json`` (a single request).
 
-        if index_file is None:
-            return {}
+    Returns an empty index if the file does not exist yet. Network errors are
+    allowed to propagate so the caller can retry them. Unlike a missing file,
+    a transient failure must not be silently read as "nothing is on OSF".
+    """
+    index_file: File | None = None
+    for remote_file in bids_root_folder.files:
+        if remote_file.name == INDEX_FILENAME:
+            index_file = remote_file
+            break
 
-        response = index_file._get(index_file._download_url)
-        if response.status_code != 200:
-            return {}
-        payload = response.json()
-    except Exception:
+    if index_file is None:
         return {}
+
+    response = index_file._get(index_file._download_url)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not download {INDEX_FILENAME} (status code {response.status_code})."
+        )
+    payload = response.json()
 
     if not isinstance(payload, dict):
         return {}
@@ -145,12 +151,48 @@ def _load_remote_index(bids_root_folder: Storage) -> DatasetIndex:
         if entry is None:
             msg = (
                 "Invalid dataset_index.json schema: expected each entry to be "
-                "an object with {'osf_path': str, 'size': int | null}."
+                "an object with {'osf_path': str, 'size': int | null, "
+                "'md5': str | null}."
             )
             raise RuntimeError(msg)
         index[str(key)] = entry
 
     return index
+
+
+def _backfill_md5_from_remote(storage: Storage, index: DatasetIndex) -> int:
+    """Fill missing ``md5`` values in ``index`` from the remote file listing.
+
+    OSF returns each file's md5 inline in the storage listing, so this is a
+    single directory walk with no per-file requests and no file downloads. It
+    is slow (OSF caps requests at 1/second) but only needed once, to populate
+    hashes into an index written before md5 tracking existed. Returns the
+    number of entries whose md5 was filled in.
+    """
+    prefix = BIDS_ROOT_NAME + "/"
+    filled = 0
+    for remote_file in storage.files:
+        materialized = remote_file.path.lstrip("/")
+        if not materialized.startswith(prefix):
+            continue
+        rel_path = materialized[len(prefix) :]
+        if not rel_path or rel_path == INDEX_FILENAME:
+            continue
+
+        entry = index.get(rel_path)
+        if entry is None or isinstance(entry.get("md5"), str):
+            continue
+
+        md5 = (getattr(remote_file, "hashes", None) or {}).get("md5")
+        if not isinstance(md5, str):
+            continue
+
+        entry["md5"] = md5
+        if not entry.get("osf_path"):
+            entry["osf_path"] = remote_file.osf_path
+        filled += 1
+
+    return filled
 
 
 def _ensure_parent_folder(
@@ -233,12 +275,26 @@ def _upload_file_once(
     filename: str,
     local_path: Path,
     *,
-    update: bool,
     folder_file_cache: dict[str, dict[str, File]],
     local_md5_cache: dict[Path, str],
     known_osf_path: str | None,
+    known_md5: str | None,
 ) -> tuple[str, str | None]:
     with open(local_path, "rb") as fp:
+        # When the index already records this file's osf_path and md5,
+        # reaching here means the local hash differs -- the file genuinely
+        # changed. Update it directly instead of streaming the whole body once
+        # just to receive a 409 and then stream it again. Requires a known md5
+        # so we do not skip the remote-hash recheck below for entries whose
+        # hash is unknown. Falls through to the create path if the file can no
+        # longer be resolved (e.g. deleted since the index was read).
+        if known_osf_path is not None and known_md5 is not None:
+            existing = _file_from_osf_path(folder.session, known_osf_path)
+            if existing is not None:
+                fp.seek(0)
+                existing.update(fp)
+                return "uploaded", existing.osf_path
+
         if file_empty(fp):
             response = folder._put(
                 folder._new_file_url,
@@ -276,13 +332,7 @@ def _upload_file_once(
         if existing is None:
             return "skipped", known_osf_path
 
-        if not update:
-            return "skipped", existing.osf_path
-
-        local_md5 = local_md5_cache.get(local_path)
-        if local_md5 is None:
-            local_md5 = checksum(local_path)
-            local_md5_cache[local_path] = local_md5
+        local_md5 = _local_md5(local_path, local_md5_cache)
 
         remote_md5 = (existing.hashes or {}).get("md5")
         if remote_md5 and local_md5 == remote_md5:
@@ -321,6 +371,10 @@ def _upload_index_once(bids_root_folder: Storage, index_bytes: bytes) -> None:
         )
 
 
+def _serialize_index(index: DatasetIndex) -> bytes:
+    return json.dumps(index, indent=2, sort_keys=True).encode()
+
+
 def _generate_index(storage: Storage) -> DatasetIndex:
     """Walk remote OSF files and build the dataset index."""
     prefix = BIDS_ROOT_NAME + "/"
@@ -341,9 +395,13 @@ def _generate_index(storage: Storage) -> DatasetIndex:
                     size = getattr(remote_file, "size", None)
                     if not isinstance(size, int) or isinstance(size, bool):
                         size = None
+                    md5 = (getattr(remote_file, "hashes", None) or {}).get("md5")
+                    if not isinstance(md5, str):
+                        md5 = None
                     index[rel_path] = {
                         "osf_path": remote_file.osf_path,
                         "size": size,
+                        "md5": md5,
                     }
                     progress.advance(task)
 
@@ -369,7 +427,8 @@ def generate_index_with_retry(
     Returns
     -------
     index : dict[str, dict[str, str | int | None]]
-        Mapping from BIDS-relative path to ``{"osf_path", "size"}`` entries.
+        Mapping from BIDS-relative path to ``{"osf_path", "size", "md5"}``
+        entries.
     """
     for attempt in range(1, max_attempts + 1):
         storage = _get_storage_with_retry(token, project_id, max_attempts=max_attempts)
@@ -398,9 +457,8 @@ def upload_dataset(
     bids_dir: Path,
     token: str,
     project_id: str,
-    update: bool = False,
 ) -> DatasetIndex:
-    """Upload all files from a local BIDS directory to OSF.
+    """Sync a local BIDS directory to OSF: upload new and changed files.
 
     Files are uploaded under the ``landemard-2026-bids/`` folder in the
     project's OSF storage, regardless of the local directory name.
@@ -413,15 +471,23 @@ def upload_dataset(
         OSF personal access token.
     project_id : str
         OSF project ID.
-    update : bool, default: False
-        Re-upload files whose MD5 differs from the remote copy. When False,
-        existing files are skipped.
 
     Returns
     -------
     index : dict[str, dict[str, str | int | None]]
         Incrementally updated mapping suitable for ``dataset_index.json``
-        upload, containing OSF path and file size in bytes.
+        upload, containing OSF path, file size in bytes, and MD5 checksum.
+
+    Notes
+    -----
+    The remote ``dataset_index.json`` (a single fast download) is the source of
+    truth for what is already on OSF and its MD5s. A file is skipped, with no
+    network transfer, when its local MD5 matches the recorded one; otherwise it
+    is uploaded. An index written before md5 tracking existed is upgraded once
+    by scanning the remote listing to backfill hashes (slow--OSF caps requests
+    at 1/second--but only needed once). The index is re-uploaded after every
+    written file, so an interrupted run resumes without re-uploading files
+    that already made it to OSF.
     """
     bids_dir = Path(bids_dir)
     all_files = sorted(path for path in bids_dir.rglob("*") if path.is_file())
@@ -432,23 +498,85 @@ def upload_dataset(
     folder_file_cache: dict[str, dict[str, File]] = {}
     local_md5_cache: dict[Path, str] = {}
 
+    def reconnect() -> None:
+        nonlocal storage, bids_root_folder, folder_cache, folder_file_cache
+        storage = _get_storage_with_retry(token, project_id, max_attempts=max_attempts)
+        bids_root_folder = storage.create_folder(BIDS_ROOT_NAME, exist_ok=True)
+        folder_cache = {"": bids_root_folder}
+        folder_file_cache = {}
+
+    def persist_index(context: str) -> None:
+        """Best-effort re-upload of the remote index so runs are resumable."""
+        try:
+            _upload_index_once(bids_root_folder, _serialize_index(index))
+        except Exception as exc:
+            if not _is_retryable(exc):
+                raise
+            try:
+                reconnect()
+                _upload_index_once(bids_root_folder, _serialize_index(index))
+            except Exception as exc2:
+                CONSOLE.print(
+                    f"[yellow]Warning:[/] could not persist index after "
+                    f"{context}: {exc2}"
+                )
+
+    # Load the published index (one request) -- fast, and the source of truth
+    # for the hash comparison. Retryable so a transient error is not misread as
+    # an empty remote.
+    index: DatasetIndex = {}
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         TimeElapsedColumn(),
         transient=True,
     ) as progress:
-        progress.add_task(
-            "[cyan]Loading existing dataset_index.json from OSF...[/]", total=None
-        )
-        remote_index = _load_remote_index(bids_root_folder)
+        progress.add_task("[cyan]Loading dataset_index.json from OSF...[/]", total=None)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                index = _load_remote_index(bids_root_folder)
+                break
+            except Exception as exc:
+                if attempt >= max_attempts or not _is_retryable(exc):
+                    raise
+                time.sleep(min(2 ** (attempt - 1), 30))
+                reconnect()
 
-    if remote_index:
-        CONSOLE.print(f"[green]Loaded {len(remote_index)} existing index entries.[/]")
+    if index:
+        CONSOLE.print(f"[green]Loaded {len(index)} entries from the remote index.[/]")
     else:
-        CONSOLE.print("[yellow]No valid remote index found; starting from empty.[/]")
+        CONSOLE.print("[yellow]No remote index found; uploading everything.[/]")
 
-    index: DatasetIndex = dict(remote_index)
+    # One-time upgrade: an index written before md5 tracking has no hashes, so
+    # the skip-check cannot work until they are backfilled. Scan the remote
+    # listing (which carries md5s) once and persist the upgraded index.
+    missing = [k for k, v in index.items() if not isinstance(v.get("md5"), str)]
+    if missing:
+        CONSOLE.print(
+            f"[yellow]{len(missing)} of {len(index)} entries lack md5.[/] "
+            "Backfilling from the OSF listing (one-time, ~1 request/second)..."
+        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            transient=True,
+        ) as progress:
+            progress.add_task("[cyan]Scanning OSF storage for hashes...[/]", total=None)
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    filled = _backfill_md5_from_remote(storage, index)
+                    break
+                except Exception as exc:
+                    if attempt >= max_attempts or not _is_retryable(exc):
+                        raise
+                    time.sleep(min(2 ** (attempt - 1), 30))
+                    reconnect()
+        CONSOLE.print(f"[green]Backfilled md5 for {filled} entries.[/]")
+        # Save immediately so the slow scan is not lost if the run is
+        # interrupted before any file upload.
+        persist_index("md5 backfill")
+
     uploaded = 0
     skipped = 0
 
@@ -470,7 +598,12 @@ def upload_dataset(
             rel_path = rel.as_posix()
             rel_dir = rel.parent.as_posix()
             filename = rel.name
-            known_osf_path = _get_index_osf_path(index, rel_path)
+
+            entry = index.get(rel_path)
+            entry_osf_path = entry.get("osf_path") if entry else None
+            known_osf_path = entry_osf_path if isinstance(entry_osf_path, str) else None
+            known_md5 = entry.get("md5") if entry else None
+            known_md5 = known_md5 if isinstance(known_md5, str) else None
 
             progress.update(
                 task,
@@ -480,8 +613,14 @@ def upload_dataset(
                 ),
             )
 
-            if not update and rel_path in index:
-                index[rel_path]["size"] = local_path.stat().st_size
+            # Decide from the index: skip files whose local hash matches the
+            # recorded one, upload the rest (new files and changed files).
+            if (
+                entry is not None
+                and known_md5 is not None
+                and _local_md5(local_path, local_md5_cache) == known_md5
+            ):
+                entry["size"] = local_path.stat().st_size
                 skipped += 1
                 progress.advance(task)
                 continue
@@ -496,10 +635,10 @@ def upload_dataset(
                         folder_key,
                         filename,
                         local_path,
-                        update=update,
                         folder_file_cache=folder_file_cache,
                         local_md5_cache=local_md5_cache,
                         known_osf_path=known_osf_path,
+                        known_md5=known_md5,
                     )
                 except Exception as exc:
                     if attempt >= max_attempts or not _is_retryable(exc):
@@ -515,17 +654,7 @@ def upload_dataset(
                         ),
                     )
                     time.sleep(wait_seconds)
-
-                    storage = _get_storage_with_retry(
-                        token,
-                        project_id,
-                        max_attempts=max_attempts,
-                    )
-                    bids_root_folder = storage.create_folder(
-                        BIDS_ROOT_NAME, exist_ok=True
-                    )
-                    folder_cache = {"": bids_root_folder}
-                    folder_file_cache = {}
+                    reconnect()
                     continue
 
                 if status == "uploaded":
@@ -542,13 +671,20 @@ def upload_dataset(
                     if existing is not None:
                         osf_path = existing.osf_path
 
+                file_md5 = _local_md5(local_path, local_md5_cache)
                 if osf_path is not None:
                     index[rel_path] = {
                         "osf_path": osf_path,
                         "size": local_path.stat().st_size,
+                        "md5": file_md5,
                     }
                 elif rel_path in index:
                     index[rel_path]["size"] = local_path.stat().st_size
+                    index[rel_path]["md5"] = file_md5
+
+                # Persist the index after each written file so an interrupted
+                # run resumes from here instead of re-uploading everything.
+                persist_index(rel_path)
                 break
 
             progress.advance(task)
@@ -580,7 +716,7 @@ def upload_index(
         OSF project ID.
     """
     max_attempts = 5
-    index_bytes = json.dumps(index, indent=2, sort_keys=True).encode()
+    index_bytes = _serialize_index(index)
 
     for attempt in range(1, max_attempts + 1):
         try:

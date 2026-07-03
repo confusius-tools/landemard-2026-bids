@@ -6,7 +6,7 @@ populations", mirrored on OSF so that ConfUSIus can fetch individual files on de
 
 This dataset is already published in fUSI-BIDS, so no conversion step is required: the
 local BIDS tree is unzipped and uploaded as-is to OSF and a `dataset_index.json` is
-built mapping each BIDS-relative path to its OSF file id and size.
+built mapping each BIDS-relative path to its OSF file id, size, and md5.
 
 ## References
 
@@ -26,7 +26,8 @@ export OSF_PROJECT=dkseb
 uv run landemard-upload --bids-dir /path/to/landemard_2026_dataset
 ```
 
-Useful options: `--update`, `--rebuild-index`.
+Useful options: `--rebuild-index`. Re-upload detects changed files automatically by
+comparing local md5s against the index.
 
 ## Licensing
 
