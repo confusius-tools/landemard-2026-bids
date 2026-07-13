@@ -269,6 +269,52 @@ def _get_folder_file_map(
     return cached
 
 
+def _recreate_file(folder: Storage, filename: str, data) -> str | None:
+    response = None
+    for attempt in range(5):
+        if hasattr(data, "seek"):
+            data.seek(0)
+        if hasattr(data, "peek") and not data.peek(1):
+            response = folder._put(folder._new_file_url, params={"name": filename}, data=b"")
+        else:
+            response = folder._put(folder._new_file_url, params={"name": filename}, data=data)
+        if response.status_code in (200, 201):
+            payload = response.json().get("data", {})
+            osf_path = payload.get("attributes", {}).get("path")
+            return osf_path if isinstance(osf_path, str) else None
+        if response.status_code != 507:
+            break
+        time.sleep(min(2 ** attempt, 8))
+
+    raise RuntimeError(
+        f"Could not replace {filename}: OSF still returned 507 after delete/recreate "
+        f"(last status code {None if response is None else response.status_code}). "
+        f"This usually means the project is actually out of storage or OSF has not freed deleted space yet."
+    )
+
+
+def _update_existing_file(
+    folder: Storage,
+    folder_key: str,
+    filename: str,
+    existing: File,
+    fp,
+    folder_file_cache: dict[str, dict[str, File]],
+) -> str | None:
+    try:
+        existing.update(fp)
+        return existing.osf_path
+    except RuntimeError as exc:
+        if "status code: 507" not in str(exc):
+            raise
+
+    # ponytail: this drops OSF file history to get past versioned-update quota issues; keep version history only if anyone actually needs old revisions.
+    existing.remove()
+    osf_path = _recreate_file(folder, existing.path, fp)
+    folder_file_cache.pop(folder_key, None)
+    return osf_path
+
+
 def _upload_file_once(
     folder: Storage,
     folder_key: str,
@@ -292,8 +338,15 @@ def _upload_file_once(
             existing = _file_from_osf_path(folder.session, known_osf_path)
             if existing is not None:
                 fp.seek(0)
-                existing.update(fp)
-                return "uploaded", existing.osf_path
+                osf_path = _update_existing_file(
+                    folder,
+                    folder_key,
+                    filename,
+                    existing,
+                    fp,
+                    folder_file_cache,
+                )
+                return "uploaded", osf_path
 
         if file_empty(fp):
             response = folder._put(
@@ -339,8 +392,15 @@ def _upload_file_once(
             return "skipped", existing.osf_path
 
         fp.seek(0)
-        existing.update(fp)
-        return "uploaded", existing.osf_path
+        osf_path = _update_existing_file(
+            folder,
+            folder_key,
+            filename,
+            existing,
+            fp,
+            folder_file_cache,
+        )
+        return "uploaded", osf_path
 
 
 def _upload_index_once(bids_root_folder: Storage, index_bytes: bytes) -> None:
@@ -365,10 +425,16 @@ def _upload_index_once(bids_root_folder: Storage, index_bytes: bytes) -> None:
         )
 
     update_response = existing._put(existing._upload_url, data=index_bytes)
-    if update_response.status_code != 200:
-        raise RuntimeError(
-            f"Could not update {INDEX_FILENAME} (status code {update_response.status_code})."
-        )
+    if update_response.status_code == 200:
+        return
+    if update_response.status_code == 507:
+        # ponytail: this drops index file history to get past OSF update quota issues; keep history only if anyone actually needs old index revisions.
+        existing.remove()
+        _recreate_file(bids_root_folder, INDEX_FILENAME, index_bytes)
+        return
+    raise RuntimeError(
+        f"Could not update {INDEX_FILENAME} (status code {update_response.status_code})."
+    )
 
 
 def _serialize_index(index: DatasetIndex) -> bytes:
