@@ -195,6 +195,24 @@ def _backfill_md5_from_remote(storage: Storage, index: DatasetIndex) -> int:
     return filled
 
 
+def _create_folder_with_retry(
+    parent: Storage,
+    name: str,
+    *,
+    exist_ok: bool = True,
+    max_attempts: int = 5,
+) -> Storage:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return parent.create_folder(name, exist_ok=exist_ok)
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable(exc):
+                raise
+            time.sleep(min(2 ** (attempt - 1), 30))
+
+    raise RuntimeError(f"Failed to create folder {name} after retries.")
+
+
 def _ensure_parent_folder(
     rel_dir: str,
     folder_cache: dict[str, Storage],
@@ -207,7 +225,8 @@ def _ensure_parent_folder(
         parent = current
         current = f"{current}/{part}" if current else part
         if current not in folder_cache:
-            folder_cache[current] = folder_cache[parent].create_folder(
+            folder_cache[current] = _create_folder_with_retry(
+                folder_cache[parent],
                 part,
                 exist_ok=True,
             )
@@ -418,7 +437,12 @@ def _upload_index_once(bids_root_folder: Storage, index_bytes: bytes) -> None:
             f"Could not upload {INDEX_FILENAME} (status code {response.status_code})."
         )
 
-    existing = _file_from_folder_name(bids_root_folder, INDEX_FILENAME)
+    existing = None
+    for attempt in range(5):
+        existing = _file_from_folder_name(bids_root_folder, INDEX_FILENAME)
+        if existing is not None:
+            break
+        time.sleep(min(2 ** attempt, 8))
     if existing is None:
         raise RuntimeError(
             f"Could not resolve existing {INDEX_FILENAME} after conflict."
@@ -559,7 +583,11 @@ def upload_dataset(
     all_files = sorted(path for path in bids_dir.rglob("*") if path.is_file())
     max_attempts = 5
     storage = _get_storage_with_retry(token, project_id, max_attempts=max_attempts)
-    bids_root_folder = storage.create_folder(BIDS_ROOT_NAME, exist_ok=True)
+    bids_root_folder = _create_folder_with_retry(
+        storage,
+        BIDS_ROOT_NAME,
+        exist_ok=True,
+    )
     folder_cache: dict[str, Storage] = {"": bids_root_folder}
     folder_file_cache: dict[str, dict[str, File]] = {}
     local_md5_cache: dict[Path, str] = {}
@@ -567,7 +595,11 @@ def upload_dataset(
     def reconnect() -> None:
         nonlocal storage, bids_root_folder, folder_cache, folder_file_cache
         storage = _get_storage_with_retry(token, project_id, max_attempts=max_attempts)
-        bids_root_folder = storage.create_folder(BIDS_ROOT_NAME, exist_ok=True)
+        bids_root_folder = _create_folder_with_retry(
+            storage,
+            BIDS_ROOT_NAME,
+            exist_ok=True,
+        )
         folder_cache = {"": bids_root_folder}
         folder_file_cache = {}
 
@@ -791,7 +823,11 @@ def upload_index(
                 project_id,
                 max_attempts=max_attempts,
             )
-            bids_root_folder = storage.create_folder(BIDS_ROOT_NAME, exist_ok=True)
+            bids_root_folder = _create_folder_with_retry(
+                storage,
+                BIDS_ROOT_NAME,
+                exist_ok=True,
+            )
             _upload_index_once(bids_root_folder, index_bytes)
         except Exception as exc:
             if attempt >= max_attempts or not _is_retryable(exc):
